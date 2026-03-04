@@ -187,6 +187,26 @@ func (n *NB) Apply(other NB) {
 	}
 }
 
+// ── membership test ───────────────────────────────────────────────────────────
+
+// HasAny reports whether any bit set in mask overlaps with n across all words.
+//
+// Semantics: "at least one error in this event mask is active."
+// Returns false if either n or mask is empty. O(min(len(n), len(mask))),
+// allocation-free.
+//
+// Typical use — evaluating a multi-bit error mask against an aggregated error bitmap:
+//
+//	if errBitmap.HasAny(nb.FromValue(errcodes.ErrOvpWarn1)) { ... }
+func (n NB) HasAny(mask NB) bool {
+	for i := range min(len(n.words), len(mask.words)) {
+		if n.words[i]&mask.words[i] != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // ── string representation ─────────────────────────────────────────────────────
 
 // String returns an LSB-first hexadecimal representation of the bitmask.

@@ -306,6 +306,38 @@ func TestStringZeroNB(t *testing.T) {
 
 // ── Union vs Apply demonstration ──────────────────────────────────────────────
 
+// ── HasAny ────────────────────────────────────────────────────────────────────
+
+func TestHasAny(t *testing.T) {
+	tests := []struct {
+		name string
+		n    NB
+		mask NB
+		want bool
+	}{
+		{"empty NB, any mask", NB{}, FromValue(0xFF), false},
+		{"zero word, any mask", FromValue(0), FromValue(0xFF), false},
+		{"mask zero always false", FromValue(0xFF), FromValue(0), false},
+		{"single matching bit", FromBit(3), FromBit(3), true},
+		{"no overlap", FromValue(0x0F), FromValue(0xF0), false},
+		{"partial overlap", FromValue(0x11), FromValue(0x01), true},
+		{"multi-bit mask, one matches", FromValue(0x10), FromValue(0x11), true},
+		{"multi-bit mask, none match", FromValue(0x04), FromValue(0x11), false},
+		{"two-word NB, mask hits word[0]", FromBit(0, 64), FromValue(0x01), true},
+		{"two-word NB, mask hits word[1]", FromBit(0, 64), FromBit(64), true},
+		{"two-word mask on one-word NB", FromValue(0x01), FromBit(0, 64), true},
+		{"empty mask on non-empty NB", FromValue(0xFF), NB{}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.n.HasAny(tc.mask)
+			if got != tc.want {
+				t.Errorf("HasAny(%s) = %v, want %v", tc.mask, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestUnionVsApply is an executable demonstration of the conversation's
 // key design decision: Union is commutative and expanding; Apply is
 // non-commutative and fixed-width.
