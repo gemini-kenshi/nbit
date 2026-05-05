@@ -11,27 +11,50 @@
 package nb
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
 
 // NB is an N-bit bitmask. The zero value (NB{}) behaves as an empty,
 // all-zero mask. Callers should not modify the words slice directly.
+//
+// Aliasing: NB carries a []uint64 by reference. Copying an NB value
+// (assignment, function argument, return value) copies the slice header
+// but shares the backing array. Mutating one copy via Set, Clear, or Apply
+// is therefore visible through every other copy of the same NB. Call Clone
+// before mutating if independence is required.
 type NB struct {
 	words []uint64
+}
+
+// Clone returns a deep copy of n with an independent backing array.
+// Use it before mutating an NB that was received from a caller, returned
+// from a constructor the caller still holds, or otherwise might be aliased.
+func (n NB) Clone() NB {
+	if len(n.words) == 0 {
+		return NB{}
+	}
+	dup := make([]uint64, len(n.words))
+	copy(dup, n.words)
+	return NB{words: dup}
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
 
 // wordsNeeded returns the number of uint64 words required to hold maxBit+1 bits.
-// Uses the round-up division idiom: ceil((maxBit + 1) / 64).
+// maxBit/64 gives the zero-based word index; +1 converts to a count.
 func wordsNeeded(maxBit int) int {
-	return (maxBit + 64) >> 6
+	return maxBit/64 + 1
 }
 
 // wordAt returns the word index and bit position within that word for a given
 // bit index. Both results are computed with a single shift and mask, O(1).
+// Panics if bit is negative — bit indices are always non-negative.
 func wordAt(bit int) (w int, pos uint) {
+	if bit < 0 {
+		panic(fmt.Sprintf("nb: negative bit index %d", bit))
+	}
 	return bit >> 6, uint(bit & 63)
 }
 
@@ -47,16 +70,22 @@ func FromValue(v uint64) NB {
 
 // FromBit creates an NB with exactly the specified bits set.
 // The backing slice is sized to hold the highest requested bit.
+// Panics if any bit is negative.
 //
-//	nb.FromBit(0, 4)     // 0x11
-//	nb.FromBit(0, 4, 32) // 0x11, 0x01  (two words)
+//	nb.FromBit(0, 4)     // single word: 0x11
+//	nb.FromBit(0, 4, 64) // two words:  0x11, 0x01  (bit 64 starts word[1])
+//
+// FromBit() with no arguments returns the empty NB{} (no backing slice).
 func FromBit(bits ...int) NB {
 	if len(bits) == 0 {
-		return NB{words: []uint64{0}}
+		return NB{}
 	}
 
 	maxBit := 0
 	for _, b := range bits {
+		if b < 0 {
+			panic(fmt.Sprintf("nb: negative bit index %d", b))
+		}
 		if b > maxBit {
 			maxBit = b
 		}
@@ -72,18 +101,20 @@ func FromBit(bits ...int) NB {
 
 // ── single-bit operations (pointer receivers — mutate in-place) ───────────────
 
-// Set sets bit at position bit. The backing slice is grown if necessary.
+// Set sets bit at position bit. The backing slice is grown in a single
+// allocation if necessary. Panics if bit is negative.
 func (n *NB) Set(bit int) {
 	w, pos := wordAt(bit)
-	// Grow if needed.
-	for len(n.words) <= w {
-		n.words = append(n.words, 0)
+	if w >= len(n.words) {
+		grown := make([]uint64, wordsNeeded(bit))
+		copy(grown, n.words)
+		n.words = grown
 	}
 	n.words[w] |= 1 << pos
 }
 
 // Clear clears the bit at position bit. If bit is beyond the current
-// capacity it is a no-op (it is already zero).
+// capacity it is a no-op (it is already zero). Panics if bit is negative.
 func (n *NB) Clear(bit int) {
 	w, pos := wordAt(bit)
 	if w >= len(n.words) {
@@ -94,6 +125,7 @@ func (n *NB) Clear(bit int) {
 
 // Test reports whether the bit at position bit is set.
 // Returns false if bit is beyond the current capacity.
+// Panics if bit is negative.
 func (n NB) Test(bit int) bool {
 	w, pos := wordAt(bit)
 	if w >= len(n.words) {
@@ -178,9 +210,9 @@ func (n NB) Union(other NB) NB {
 // the valid bit space. Think of it as writing external flags into a fixed-width
 // status register — overflow is not an error; it is discarded.
 //
-//	a = FromValue(0x11)   // 1 word
-//	b = FromBit(4, 8)     // 2 words: 0x10, 0x01
-//	a.Apply(b)            // a == 0x11 | 0x10 = 0x11 (only word 0 of b used)
+//	a = FromValue(0x11)   // 1 word:  0x11
+//	b = FromBit(4, 64)    // 2 words: 0x10, 0x01
+//	a.Apply(b)            // a == 0x11 | 0x10 = 0x11 (b's word[1] is dropped)
 func (n *NB) Apply(other NB) {
 	for i := 0; i < len(n.words) && i < len(other.words); i++ {
 		n.words[i] |= other.words[i]
@@ -188,6 +220,29 @@ func (n *NB) Apply(other NB) {
 }
 
 // ── membership test ───────────────────────────────────────────────────────────
+
+// HasAll reports whether every bit set in mask is also set in n (subset test).
+//
+// Semantics: "all errors in this event mask are active."
+// Returns true if mask is empty (vacuously true). Allocation-free; O(max(len(n), len(mask))).
+//
+// Typical use — require all bits in a multi-bit condition mask to be active:
+//
+//	if errBitmap.HasAll(nb.FromValue(errcodes.ErrCriticalPair)) { ... }
+func (n NB) HasAll(mask NB) bool {
+	for i := range min(len(n.words), len(mask.words)) {
+		if n.words[i]&mask.words[i] != mask.words[i] {
+			return false
+		}
+	}
+	// Mask bits beyond n's length cannot be set in n.
+	for i := len(n.words); i < len(mask.words); i++ {
+		if mask.words[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
 
 // HasAny reports whether any bit set in mask overlaps with n across all words.
 //
@@ -213,19 +268,53 @@ func (n NB) HasAny(mask NB) bool {
 // Each 64-bit word is formatted as "0x%02x" and joined by ", ".
 // word[0] holds bits 0–63 (least significant), word[1] bits 64–127, etc.
 //
-//	FromBit(0, 4, 32).String()  →  "0x11, 0x01"
-//
-// Note: bit 32 falls in word 0 (bits 0–63), so the example above produces
-// a single-word result 0x11 | (1<<32) = "0x100000011".
-//
-//	FromBit(0, 4, 64).String()  →  "0x11, 0x01"  (bit 64 starts word[1])
+//	FromBit(0, 4).String()       →  "0x11"
+//	FromBit(0, 4, 64).String()   →  "0x11, 0x01"   (bit 64 starts word[1])
+//	FromBit(0, 4, 32).String()   →  "0x100000011"  (bit 32 still fits in word[0])
 func (n NB) String() string {
 	if len(n.words) == 0 {
 		return "0x00"
 	}
 	parts := make([]string, len(n.words))
 	for i, w := range n.words {
-		parts[i] = fmt.Sprintf("0x%02x", w)
+		parts[i] = fmt.Sprintf("0x%02x", w) // %02x: minimum two hex digits so a zero word prints as "0x00"
 	}
 	return strings.Join(parts, ", ")
+}
+
+// ── JSON serialization ────────────────────────────────────────────────────────
+
+// MarshalJSON encodes n as a JSON array of decimal uint64 words, LSB-first.
+// Trailing zero words are stripped so the encoding is canonical:
+// NB{}.MarshalJSON() and FromValue(0).MarshalJSON() both return []byte("[]").
+//
+// Round-trip preserves Equal, not len(words):
+//
+//	parsed.Equal(original) is always true; len(parsed.words) may differ.
+func (n NB) MarshalJSON() ([]byte, error) {
+	end := len(n.words)
+	for end > 0 && n.words[end-1] == 0 {
+		end--
+	}
+	if end == 0 {
+		return []byte("[]"), nil
+	}
+	return json.Marshal(n.words[:end])
+}
+
+// UnmarshalJSON decodes a JSON array of decimal uint64 words into n.
+// JSON null and [] both produce the zero-value NB. Replaces any prior content.
+func (n *NB) UnmarshalJSON(data []byte) error {
+	var words []uint64
+	if err := json.Unmarshal(data, &words); err != nil {
+		return fmt.Errorf("nb: unmarshal: %w", err)
+	}
+	// json.Unmarshal leaves words nil for JSON null and empty for "[]";
+	// both collapse to the zero-value NB via the len check below.
+	if len(words) == 0 {
+		*n = NB{}
+		return nil
+	}
+	*n = NB{words: words}
+	return nil
 }

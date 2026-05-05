@@ -57,7 +57,32 @@ func main() {
 
 ## API Reference
 
+### Aliasing & Clone
+
+`NB` wraps a `[]uint64`. Copying an `NB` value (assignment, function argument, return value) copies the slice header but **shares the backing array**. Any mutation through one copy via `Set`, `Clear`, or `Apply` is visible through every other copy of the same `NB`.
+
+```go
+a := nb.FromValue(0x01)
+b := a            // shallow copy — shares storage
+(&b).Set(1)
+a.Test(1)         // true — surprise!
+
+c := a.Clone()    // independent backing array
+(&c).Set(8)
+a.Test(8)         // false — Clone broke the aliasing
+```
+
+Use `Clone()` whenever you need to mutate an `NB` you received from a caller, returned from a constructor the caller still holds, or otherwise might be aliased.
+
+#### `(n NB) Clone() NB`
+
+Returns a deep copy with an independent backing array. Cheap (`len(n.words)` `uint64` copy) and safe to call on the zero-value `NB{}`.
+
+---
+
 ### Construction
+
+Negative bit indices are a programming error and panic immediately with `nb: negative bit index N`. This applies to `FromBit`, `Set`, `Clear`, and `Test`.
 
 #### `FromValue(v uint64) NB`
 
@@ -69,7 +94,7 @@ flags := nb.FromValue(0b00010011) // bits 0, 1, 4 set
 
 #### `FromBit(bits ...int) NB`
 
-Creates a bitmask with exactly the named bit positions set. The backing slice is sized just large enough to hold the highest bit.
+Creates a bitmask with exactly the named bit positions set. The backing slice is sized just large enough to hold the highest bit. `FromBit()` with no arguments returns the zero-value `NB{}` (no backing slice).
 
 ```go
 a := nb.FromBit(0, 4)       // 1 word  — "0x11"
@@ -232,6 +257,68 @@ aCopy.Equal(bCopy)           // false — different widths, different semantics
 
 ---
 
+### Membership Tests
+
+#### `(n NB) HasAny(mask NB) bool`
+
+Reports whether **at least one** bit set in `mask` is also set in `n`. Allocation-free; O(min(len(n), len(mask))).
+
+```go
+errBitmap.HasAny(nb.FromValue(errcodes.ErrOvpWarn1)) // any warning active?
+```
+
+#### `(n NB) HasAll(mask NB) bool`
+
+Reports whether **every** bit set in `mask` is also set in `n` (subset test). Returns `true` if `mask` is empty (vacuously true). Allocation-free; O(max(len(n), len(mask))).
+
+```go
+// Require both conditions active before triggering a combined action.
+if errBitmap.HasAll(nb.FromBit(errcodes.ErrOvpWarn1, errcodes.ErrUvpWarn1)) {
+    // both over-voltage and under-voltage warnings are active
+}
+```
+
+**Contrast with `HasAny`:**
+
+| Method | Meaning | Short-circuits on |
+|--------|---------|------------------|
+| `HasAny(mask)` | At least one bit in `mask` is set | First *matching* word |
+| `HasAll(mask)` | All bits in `mask` are set | First *failing* word |
+
+---
+
+### JSON Encoding
+
+`NB` implements `json.Marshaler` and `json.Unmarshaler`. The wire format is a **JSON array of decimal `uint64` words, LSB-first** — the same ordering as the in-memory layout.
+
+| `NB` value | JSON |
+|---|---|
+| `NB{}` | `[]` |
+| `FromValue(0)` | `[]` |
+| `FromValue(0x11)` | `[17]` |
+| `FromBit(0, 4, 64)` | `[17,1]` |
+| `FromBit(63)` | `[9223372036854775808]` |
+
+**Canonicalization:** trailing zero words are stripped on marshal. `NB{}` and `FromValue(0)` both marshal to `[]`. Round-trip preserves `Equal`, not `len(words)`: `parsed.Equal(original)` is always `true`; the backing-slice length may be smaller after unmarshal if the original had trailing zeros.
+
+```go
+type Report struct {
+    ErrBitmap nb.NB `json:"errBitmap"`
+}
+
+r := Report{ErrBitmap: nb.FromBit(0, 4, 64)}
+data, _ := json.Marshal(r)
+// {"errBitmap":[17,1]}
+
+var got Report
+json.Unmarshal(data, &got)
+got.ErrBitmap.Equal(r.ErrBitmap) // true
+```
+
+JSON `null` and `[]` both unmarshal to the zero-value `NB{}`.
+
+---
+
 ### String Representation
 
 #### `(n NB) String() string`
@@ -292,7 +379,9 @@ The `[]uint64` layout is 8× more compact than `[]bool` and keeps all flag data 
 |----------|--------------------|
 | Merging two independent flag sets | `Union` |
 | Writing event flags into a fixed status register | `Apply` |
-| Checking if a flag set is active | `Mask` + `Equal` |
+| Checking if any flag in a set is active | `HasAny` |
+| Checking if all flags in a set are active | `HasAll` |
+| Subset check (`y ⊆ x`) | `Mask` + `Equal` |
 | Checking if two flag sets are disjoint | `Mask` + `IsZero` |
 | Querying a single feature flag | `Test` |
 | Logging / debugging a bitmask | `String` (via `fmt`) |

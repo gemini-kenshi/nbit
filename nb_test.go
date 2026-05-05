@@ -1,6 +1,11 @@
+// Package nb white-box tests. The test file lives in package nb (not nb_test)
+// so it can inspect the unexported words field to verify internal layout.
+// This is intentional: the []uint64 representation is stable and its layout
+// is part of the documented contract (LSB-first, word[0] = bits 0–63).
 package nb
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -27,7 +32,7 @@ func TestFromBit(t *testing.T) {
 	}{
 		{"single bit 0", []int{0}, 1},
 		{"bits 0 and 4", []int{0, 4}, 0x11},
-		{"empty", []int{}, 0},
+		{"bit 63 (top of word 0)", []int{63}, 1 << 63},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -36,6 +41,19 @@ func TestFromBit(t *testing.T) {
 				t.Errorf("word[0] = 0x%x, want 0x%x", n.words[0], tc.want)
 			}
 		})
+	}
+}
+
+func TestFromBitEmptyIsZeroValue(t *testing.T) {
+	n := FromBit()
+	if len(n.words) != 0 {
+		t.Errorf("FromBit() should return zero-value NB, got %d words", len(n.words))
+	}
+	if !n.IsZero() {
+		t.Error("FromBit() should be zero")
+	}
+	if !n.Equal(NB{}) {
+		t.Error("FromBit() should equal NB{}")
 	}
 }
 
@@ -338,6 +356,35 @@ func TestHasAny(t *testing.T) {
 	}
 }
 
+// ── HasAll ────────────────────────────────────────────────────────────────────
+
+func TestHasAll(t *testing.T) {
+	tests := []struct {
+		name string
+		n    NB
+		mask NB
+		want bool
+	}{
+		{"empty mask always true (vacuous)", FromValue(0xFF), NB{}, true},
+		{"empty NB, non-empty mask", NB{}, FromValue(0xFF), false},
+		{"exact match", FromBit(0, 4), FromBit(0, 4), true},
+		{"superset: n has more bits", FromBit(0, 4, 8), FromBit(0, 4), true},
+		{"subset: mask has extra bit", FromBit(0, 4), FromBit(0, 4, 8), false},
+		{"no overlap", FromValue(0x0F), FromValue(0xF0), false},
+		{"mask hits word[1], n is 1-word", FromValue(0xFF), FromBit(0, 64), false},
+		{"both 2-word, all match", FromBit(0, 4, 64), FromBit(0, 64), true},
+		{"both 2-word, word[1] mismatch", FromBit(0, 64), FromBit(0, 65), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.n.HasAll(tc.mask)
+			if got != tc.want {
+				t.Errorf("HasAll(%s) = %v, want %v", tc.mask, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestUnionVsApply is an executable demonstration of the conversation's
 // key design decision: Union is commutative and expanding; Apply is
 // non-commutative and fixed-width.
@@ -369,5 +416,192 @@ func TestUnionVsApply(t *testing.T) {
 	bCopy.Apply(a)
 	if len(bCopy.words) != 2 {
 		t.Errorf("b.Apply(a) must keep b's width: got %d words", len(bCopy.words))
+	}
+}
+
+// ── Clone & aliasing ──────────────────────────────────────────────────────────
+
+func TestCloneIndependence(t *testing.T) {
+	a := FromValue(0x11)
+	b := a.Clone()
+	b.Set(8)
+	if a.Test(8) {
+		t.Error("Clone should not share backing storage with the source")
+	}
+	if !b.Test(8) {
+		t.Error("Clone copy should reflect its own mutations")
+	}
+}
+
+func TestCloneOfEmptyNB(t *testing.T) {
+	if !(NB{}).Clone().Equal(NB{}) {
+		t.Error("Clone of zero-value NB should equal NB{}")
+	}
+	if !FromBit().Clone().IsZero() {
+		t.Error("Clone of empty FromBit() should be zero")
+	}
+}
+
+func TestValueCopyAliasesBacking(t *testing.T) {
+	// This test pins down the documented aliasing rule. If this ever
+	// changes (e.g. NB switches to copy-on-write), update the docs.
+	a := FromValue(0x01)
+	b := a // shallow copy; shares backing array
+	(&b).Set(1)
+	if !a.Test(1) {
+		t.Error("aliasing contract: mutation through a copy should be visible on the source until Clone is used")
+	}
+
+	// And Clone breaks the aliasing.
+	c := a.Clone()
+	(&c).Set(8)
+	if a.Test(8) {
+		t.Error("Clone must break aliasing; source must not see post-clone mutations")
+	}
+}
+
+// ── negative-bit panics ───────────────────────────────────────────────────────
+
+func TestNegativeBitPanics(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func()
+	}{
+		{"FromBit", func() { FromBit(-1) }},
+		{"Set", func() { n := FromValue(0); n.Set(-1) }},
+		{"Clear", func() { n := FromValue(0); n.Clear(-1) }},
+		{"Test", func() { _ = FromValue(0).Test(-1) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("%s with negative bit should panic", tc.name)
+				}
+			}()
+			tc.fn()
+		})
+	}
+}
+
+// ── Set growth single-allocation sanity ───────────────────────────────────────
+
+func TestSetGrowsToExactWordIndex(t *testing.T) {
+	// After Set on a far-away bit, len(words) must equal w+1 exactly.
+	n := FromValue(0)
+	n.Set(200) // word index 3 (200 >> 6 == 3)
+	if len(n.words) != 4 {
+		t.Errorf("expected len==4 after Set(200), got %d", len(n.words))
+	}
+	if !n.Test(200) {
+		t.Error("bit 200 should be set")
+	}
+	// Earlier words must remain zero.
+	for i := 0; i < 3; i++ {
+		if n.words[i] != 0 {
+			t.Errorf("word[%d] should be 0, got 0x%x", i, n.words[i])
+		}
+	}
+}
+
+// ── JSON marshaling ───────────────────────────────────────────────────────────
+
+func TestJSONRoundTrip(t *testing.T) {
+	trailing := FromBit(0, 64)
+	trailing.Clear(64) // word[1] becomes zero; should be stripped on marshal
+
+	cases := []struct {
+		name string
+		n    NB
+	}{
+		{"zero value", NB{}},
+		{"FromValue(0)", FromValue(0)},
+		{"FromValue(0x11)", FromValue(0x11)},
+		{"two-word", FromBit(0, 4, 64)},
+		{"high bit in word 0", FromBit(63)},
+		{"three-word", func() NB { n := NB{}; n.Set(200); return n }()},
+		{"trailing zero stripped", trailing},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := json.Marshal(tc.n)
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			var got NB
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if !got.Equal(tc.n) {
+				t.Errorf("round-trip: got %s, want %s", got, tc.n)
+			}
+		})
+	}
+}
+
+func TestJSONMarshalShape(t *testing.T) {
+	cases := []struct {
+		n    NB
+		want string
+	}{
+		{NB{}, "[]"},
+		{FromBit(0, 4), "[17]"},
+	}
+	for _, tc := range cases {
+		data, err := json.Marshal(tc.n)
+		if err != nil {
+			t.Fatalf("Marshal(%s): %v", tc.n, err)
+		}
+		if string(data) != tc.want {
+			t.Errorf("Marshal(%s) = %s, want %s", tc.n, data, tc.want)
+		}
+	}
+}
+
+func TestJSONUnmarshalNull(t *testing.T) {
+	var n NB
+	if err := json.Unmarshal([]byte("null"), &n); err != nil {
+		t.Fatalf("Unmarshal(null): %v", err)
+	}
+	if !n.IsZero() {
+		t.Errorf("Unmarshal(null) should produce zero NB, got %s", n)
+	}
+}
+
+func TestJSONUnmarshalReplaces(t *testing.T) {
+	n := FromValue(0xFF)
+	if err := json.Unmarshal([]byte("[1]"), &n); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !n.Equal(FromValue(1)) {
+		t.Errorf("Unmarshal should replace prior content, got %s", n)
+	}
+}
+
+func TestJSONUnmarshalRejectsGarbage(t *testing.T) {
+	cases := []string{`"abc"`, `{}`, `["x"]`}
+	for _, input := range cases {
+		var n NB
+		if err := json.Unmarshal([]byte(input), &n); err == nil {
+			t.Errorf("Unmarshal(%s) should return error", input)
+		}
+	}
+}
+
+func TestJSONInsideStruct(t *testing.T) {
+	type Report struct {
+		ErrBitmap NB `json:"errBitmap"`
+	}
+	original := Report{ErrBitmap: FromBit(0, 4, 64)}
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got Report
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !got.ErrBitmap.Equal(original.ErrBitmap) {
+		t.Errorf("struct round-trip: got %s, want %s", got.ErrBitmap, original.ErrBitmap)
 	}
 }
