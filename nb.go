@@ -13,6 +13,8 @@ package nb
 import (
 	"encoding/json"
 	"fmt"
+	"math/bits"
+	"strconv"
 	"strings"
 )
 
@@ -123,10 +125,10 @@ func (n *NB) Clear(bit int) {
 	n.words[w] &^= 1 << pos
 }
 
-// Test reports whether the bit at position bit is set.
+// IsSet reports whether the bit at position bit is set.
 // Returns false if bit is beyond the current capacity.
 // Panics if bit is negative.
-func (n NB) Test(bit int) bool {
+func (n NB) IsSet(bit int) bool {
 	w, pos := wordAt(bit)
 	if w >= len(n.words) {
 		return false
@@ -172,7 +174,7 @@ func (n NB) IsZero() bool {
 func (n NB) Mask(other NB) NB {
 	minLen := min(len(n.words), len(other.words))
 	res := make([]uint64, minLen)
-	for i := 0; i < minLen; i++ {
+	for i := range minLen {
 		res[i] = n.words[i] & other.words[i]
 	}
 	return NB{words: res}
@@ -214,7 +216,7 @@ func (n NB) Union(other NB) NB {
 //	b = FromBit(4, 64)    // 2 words: 0x10, 0x01
 //	a.Apply(b)            // a == 0x11 | 0x10 = 0x11 (b's word[1] is dropped)
 func (n *NB) Apply(other NB) {
-	for i := 0; i < len(n.words) && i < len(other.words); i++ {
+	for i := range min(len(n.words), len(other.words)) {
 		n.words[i] |= other.words[i]
 	}
 }
@@ -264,57 +266,78 @@ func (n NB) HasAny(mask NB) bool {
 
 // ── string representation ─────────────────────────────────────────────────────
 
-// String returns an LSB-first hexadecimal representation of the bitmask.
-// Each 64-bit word is formatted as "0x%02x" and joined by ", ".
-// word[0] holds bits 0–63 (least significant), word[1] bits 64–127, etc.
-//
-//	FromBit(0, 4).String()       →  "0x11"
-//	FromBit(0, 4, 64).String()   →  "0x11, 0x01"   (bit 64 starts word[1])
-//	FromBit(0, 4, 32).String()   →  "0x100000011"  (bit 32 still fits in word[0])
-func (n NB) String() string {
-	if len(n.words) == 0 {
-		return "0x00"
-	}
-	parts := make([]string, len(n.words))
+// setBits returns the positions of all set bits in ascending order.
+// O(k) where k = number of set bits. Result is sorted by construction.
+func (n NB) setBits() []int {
+	var out []int
 	for i, w := range n.words {
-		parts[i] = fmt.Sprintf("0x%02x", w) // %02x: minimum two hex digits so a zero word prints as "0x00"
+		for w != 0 {
+			pos := bits.TrailingZeros64(w)
+			out = append(out, i*64+pos)
+			w &= w - 1
+		}
 	}
-	return strings.Join(parts, ", ")
+	return out
+}
+
+// String returns the set bit positions as a sorted, space-separated list
+// enclosed in square brackets.
+//
+//	FromBit(0, 4).String()       →  "[0 4]"
+//	FromBit(0, 4, 64).String()   →  "[0 4 64]"
+//	NB{}.String()                →  "[]"
+func (n NB) String() string {
+	b := n.setBits()
+	if len(b) == 0 {
+		return "[]"
+	}
+	var sb strings.Builder
+	sb.WriteByte('[')
+	for i, pos := range b {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(strconv.Itoa(pos))
+	}
+	sb.WriteByte(']')
+	return sb.String()
 }
 
 // ── JSON serialization ────────────────────────────────────────────────────────
 
-// MarshalJSON encodes n as a JSON array of decimal uint64 words, LSB-first.
-// Trailing zero words are stripped so the encoding is canonical:
-// NB{}.MarshalJSON() and FromValue(0).MarshalJSON() both return []byte("[]").
+// MarshalJSON encodes n as a JSON array of set bit positions in ascending order.
+// Both NB{} and FromValue(0) marshal to "[]".
 //
-// Round-trip preserves Equal, not len(words):
+//	FromBit(0, 4).MarshalJSON()       →  [0,4]
+//	FromBit(0, 4, 64).MarshalJSON()   →  [0,4,64]
 //
-//	parsed.Equal(original) is always true; len(parsed.words) may differ.
+// Round-trip preserves Equal: parsed.Equal(original) is always true.
 func (n NB) MarshalJSON() ([]byte, error) {
-	end := len(n.words)
-	for end > 0 && n.words[end-1] == 0 {
-		end--
-	}
-	if end == 0 {
+	b := n.setBits()
+	if len(b) == 0 {
 		return []byte("[]"), nil
 	}
-	return json.Marshal(n.words[:end])
+	return json.Marshal(b)
 }
 
-// UnmarshalJSON decodes a JSON array of decimal uint64 words into n.
+// UnmarshalJSON decodes a JSON array of bit positions into n.
 // JSON null and [] both produce the zero-value NB. Replaces any prior content.
+// Returns an error for negative bit positions.
 func (n *NB) UnmarshalJSON(data []byte) error {
-	var words []uint64
-	if err := json.Unmarshal(data, &words); err != nil {
-		return fmt.Errorf("nb: unmarshal: %w", err)
-	}
-	// json.Unmarshal leaves words nil for JSON null and empty for "[]";
-	// both collapse to the zero-value NB via the len check below.
-	if len(words) == 0 {
+	if string(data) == "null" {
 		*n = NB{}
 		return nil
 	}
-	*n = NB{words: words}
+	var positions []int
+	if err := json.Unmarshal(data, &positions); err != nil {
+		return fmt.Errorf("nb: unmarshal: %w", err)
+	}
+	*n = NB{}
+	for _, pos := range positions {
+		if pos < 0 {
+			return fmt.Errorf("nb: unmarshal: negative bit position %d", pos)
+		}
+		n.Set(pos)
+	}
 	return nil
 }

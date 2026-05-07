@@ -49,7 +49,7 @@ func main() {
 
     // Multi-word mask (bit 64 starts word[1]).
     wide := nb.FromBit(0, 4, 64)
-    fmt.Println(wide) // 0x11, 0x01
+    fmt.Println(wide) // [0 4 64]
 }
 ```
 
@@ -65,11 +65,11 @@ func main() {
 a := nb.FromValue(0x01)
 b := a            // shallow copy — shares storage
 (&b).Set(1)
-a.Test(1)         // true — surprise!
+a.IsSet(1)         // true — surprise!
 
 c := a.Clone()    // independent backing array
 (&c).Set(8)
-a.Test(8)         // false — Clone broke the aliasing
+a.IsSet(8)         // false — Clone broke the aliasing
 ```
 
 Use `Clone()` whenever you need to mutate an `NB` you received from a caller, returned from a constructor the caller still holds, or otherwise might be aliased.
@@ -97,8 +97,8 @@ flags := nb.FromValue(0b00010011) // bits 0, 1, 4 set
 Creates a bitmask with exactly the named bit positions set. The backing slice is sized just large enough to hold the highest bit. `FromBit()` with no arguments returns the zero-value `NB{}` (no backing slice).
 
 ```go
-a := nb.FromBit(0, 4)       // 1 word  — "0x11"
-b := nb.FromBit(0, 4, 64)   // 2 words — "0x11, 0x01"
+a := nb.FromBit(0, 4)       // 1 word  — "[0 4]"
+b := nb.FromBit(0, 4, 64)   // 2 words — "[0 4 64]"
 ```
 
 ---
@@ -127,14 +127,14 @@ n.Clear(0)  // n is now 0xfe
 n.Clear(99) // no-op — bit 99 is outside n's single word
 ```
 
-#### `(n NB) Test(bit int) bool`
+#### `(n NB) IsSet(bit int) bool`
 
 Reports whether the bit at position `bit` is set. Returns `false` if `bit` is beyond capacity.
 
 ```go
 n := nb.FromBit(3, 7)
-n.Test(3)   // true
-n.Test(200) // false — safely out of bounds
+n.IsSet(3)   // true
+n.IsSet(200) // false — safely out of bounds
 ```
 
 ---
@@ -174,7 +174,7 @@ Returns the bitwise AND of `n` and `other`. The result has `min(len(n), len(othe
 ```go
 a := nb.FromValue(0xFF)
 b := nb.FromValue(0x0F)
-a.Mask(b).String() // "0x0f"
+a.Mask(b).String() // "[0 1 2 3]"
 ```
 
 **Classic subset test** — is `b` a subset of `a`?
@@ -289,17 +289,17 @@ if errBitmap.HasAll(nb.FromBit(errcodes.ErrOvpWarn1, errcodes.ErrUvpWarn1)) {
 
 ### JSON Encoding
 
-`NB` implements `json.Marshaler` and `json.Unmarshaler`. The wire format is a **JSON array of decimal `uint64` words, LSB-first** — the same ordering as the in-memory layout.
+`NB` implements `json.Marshaler` and `json.Unmarshaler`. The wire format is a **JSON array of set bit positions in ascending order** — directly showing which flags are active, with no decoding required.
 
 | `NB` value | JSON |
 |---|---|
 | `NB{}` | `[]` |
 | `FromValue(0)` | `[]` |
-| `FromValue(0x11)` | `[17]` |
-| `FromBit(0, 4, 64)` | `[17,1]` |
-| `FromBit(63)` | `[9223372036854775808]` |
+| `FromBit(0, 4)` | `[0,4]` |
+| `FromBit(0, 4, 64)` | `[0,4,64]` |
+| `FromBit(63)` | `[63]` |
 
-**Canonicalization:** trailing zero words are stripped on marshal. `NB{}` and `FromValue(0)` both marshal to `[]`. Round-trip preserves `Equal`, not `len(words)`: `parsed.Equal(original)` is always `true`; the backing-slice length may be smaller after unmarshal if the original had trailing zeros.
+**Round-trip:** `parsed.Equal(original)` is always `true`. JSON `null` and `[]` both unmarshal to the zero-value `NB{}`. Negative positions are rejected with an error.
 
 ```go
 type Report struct {
@@ -308,14 +308,12 @@ type Report struct {
 
 r := Report{ErrBitmap: nb.FromBit(0, 4, 64)}
 data, _ := json.Marshal(r)
-// {"errBitmap":[17,1]}
+// {"errBitmap":[0,4,64]}
 
 var got Report
 json.Unmarshal(data, &got)
 got.ErrBitmap.Equal(r.ErrBitmap) // true
 ```
-
-JSON `null` and `[]` both unmarshal to the zero-value `NB{}`.
 
 ---
 
@@ -323,16 +321,16 @@ JSON `null` and `[]` both unmarshal to the zero-value `NB{}`.
 
 #### `(n NB) String() string`
 
-Implements `fmt.Stringer`. Returns an **LSB-first** hexadecimal representation: word[0] (bits 0–63) is printed first, word[1] (bits 64–127) second, and so on. Each word is formatted as `0x%02x` and separated by `, `.
+Implements `fmt.Stringer`. Returns the **sorted set bit positions** enclosed in square brackets — directly readable as a list of active flags, with no hex or word-offset decoding required.
 
 ```go
-nb.FromValue(0x11).String()       // "0x11"
-nb.FromBit(0, 4, 64).String()     // "0x11, 0x01"
-nb.FromBit(0, 4, 128).String()    // "0x11, 0x00, 0x01"
-NB{}.String()                     // "0x00"
+nb.FromBit(0, 4).String()         // "[0 4]"
+nb.FromBit(0, 4, 64).String()     // "[0 4 64]"
+nb.FromBit(0, 128).String()       // "[0 128]"  (zero middle word produces no gap)
+NB{}.String()                     // "[]"
 ```
 
-The LSB-first ordering matches how embedded systems and protocol specifications typically lay out multi-byte flag fields (byte 0 = least significant).
+This format is intentional for debugging over transports like MQTT, where a human reading `[0 4 64]` immediately knows which three flags are active without any bit-shifting.
 
 ---
 
@@ -383,7 +381,7 @@ The `[]uint64` layout is 8× more compact than `[]bool` and keeps all flag data 
 | Checking if all flags in a set are active | `HasAll` |
 | Subset check (`y ⊆ x`) | `Mask` + `Equal` |
 | Checking if two flag sets are disjoint | `Mask` + `IsZero` |
-| Querying a single feature flag | `Test` |
+| Querying a single feature flag | `IsSet` |
 | Logging / debugging a bitmask | `String` (via `fmt`) |
 
 ---

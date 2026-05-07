@@ -13,13 +13,13 @@ import (
 
 func TestFromValue(t *testing.T) {
 	n := FromValue(0x11)
-	if !n.Test(0) {
+	if !n.IsSet(0) {
 		t.Error("bit 0 should be set")
 	}
-	if !n.Test(4) {
+	if !n.IsSet(4) {
 		t.Error("bit 4 should be set")
 	}
-	if n.Test(1) {
+	if n.IsSet(1) {
 		t.Error("bit 1 should not be set")
 	}
 }
@@ -81,14 +81,14 @@ func TestFromValueAndFromBitEquivalence(t *testing.T) {
 
 // ── single-bit operations ─────────────────────────────────────────────────────
 
-func TestSetClearTest(t *testing.T) {
+func TestSetClearIsSet(t *testing.T) {
 	n := FromValue(0)
 	n.Set(3)
-	if !n.Test(3) {
+	if !n.IsSet(3) {
 		t.Error("bit 3 should be set after Set(3)")
 	}
 	n.Clear(3)
-	if n.Test(3) {
+	if n.IsSet(3) {
 		t.Error("bit 3 should be cleared after Clear(3)")
 	}
 }
@@ -100,7 +100,7 @@ func TestSetGrowsSlice(t *testing.T) {
 	if len(n.words) != 2 {
 		t.Fatalf("expected 2 words after Set(64), got %d", len(n.words))
 	}
-	if !n.Test(64) {
+	if !n.IsSet(64) {
 		t.Error("bit 64 should be set")
 	}
 }
@@ -108,15 +108,15 @@ func TestSetGrowsSlice(t *testing.T) {
 func TestClearOutOfBoundsIsNoop(t *testing.T) {
 	n := FromValue(0x11)
 	n.Clear(200) // far beyond capacity — must not panic
-	if !n.Test(0) || !n.Test(4) {
+	if !n.IsSet(0) || !n.IsSet(4) {
 		t.Error("existing bits should be unchanged after out-of-bounds Clear")
 	}
 }
 
-func TestTestOutOfBoundsReturnsFalse(t *testing.T) {
+func TestIsSetOutOfBoundsReturnsFalse(t *testing.T) {
 	n := FromValue(0x11)
-	if n.Test(200) {
-		t.Error("Test(200) should return false for a single-word NB")
+	if n.IsSet(200) {
+		t.Error("IsSet(200) should return false for a single-word NB")
 	}
 }
 
@@ -298,27 +298,33 @@ func TestApplyIsNonCommutative(t *testing.T) {
 // ── String ────────────────────────────────────────────────────────────────────
 
 func TestStringSingleWord(t *testing.T) {
-	n := FromBit(0, 4) // 0x11
+	n := FromBit(0, 4)
 	got := n.String()
-	if got != "0x11" {
-		t.Errorf("String() = %q, want %q", got, "0x11")
+	if got != "[0 4]" {
+		t.Errorf("String() = %q, want %q", got, "[0 4]")
 	}
 }
 
 func TestStringMultiWord(t *testing.T) {
-	// bit 64 → word[1]; bits 0,4 → word[0]
+	// bit 64 starts word[1]; bits 0 and 4 are in word[0]
 	n := FromBit(0, 4, 64)
 	got := n.String()
-	want := "0x11, 0x01"
+	want := "[0 4 64]"
 	if got != want {
 		t.Errorf("String() = %q, want %q", got, want)
+	}
+
+	// bit 128 starts word[2]; word[1] is zero — no gap appears in output
+	sparse := FromBit(0, 128)
+	if got := sparse.String(); got != "[0 128]" {
+		t.Errorf("String() sparse = %q, want %q", got, "[0 128]")
 	}
 }
 
 func TestStringZeroNB(t *testing.T) {
 	n := NB{}
-	if n.String() != "0x00" {
-		t.Errorf("String() of empty NB = %q, want %q", n.String(), "0x00")
+	if n.String() != "[]" {
+		t.Errorf("String() of empty NB = %q, want %q", n.String(), "[]")
 	}
 }
 
@@ -425,10 +431,10 @@ func TestCloneIndependence(t *testing.T) {
 	a := FromValue(0x11)
 	b := a.Clone()
 	b.Set(8)
-	if a.Test(8) {
+	if a.IsSet(8) {
 		t.Error("Clone should not share backing storage with the source")
 	}
-	if !b.Test(8) {
+	if !b.IsSet(8) {
 		t.Error("Clone copy should reflect its own mutations")
 	}
 }
@@ -448,14 +454,14 @@ func TestValueCopyAliasesBacking(t *testing.T) {
 	a := FromValue(0x01)
 	b := a // shallow copy; shares backing array
 	(&b).Set(1)
-	if !a.Test(1) {
+	if !a.IsSet(1) {
 		t.Error("aliasing contract: mutation through a copy should be visible on the source until Clone is used")
 	}
 
 	// And Clone breaks the aliasing.
 	c := a.Clone()
 	(&c).Set(8)
-	if a.Test(8) {
+	if a.IsSet(8) {
 		t.Error("Clone must break aliasing; source must not see post-clone mutations")
 	}
 }
@@ -470,7 +476,7 @@ func TestNegativeBitPanics(t *testing.T) {
 		{"FromBit", func() { FromBit(-1) }},
 		{"Set", func() { n := FromValue(0); n.Set(-1) }},
 		{"Clear", func() { n := FromValue(0); n.Clear(-1) }},
-		{"Test", func() { _ = FromValue(0).Test(-1) }},
+		{"IsSet", func() { _ = FromValue(0).IsSet(-1) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -493,7 +499,7 @@ func TestSetGrowsToExactWordIndex(t *testing.T) {
 	if len(n.words) != 4 {
 		t.Errorf("expected len==4 after Set(200), got %d", len(n.words))
 	}
-	if !n.Test(200) {
+	if !n.IsSet(200) {
 		t.Error("bit 200 should be set")
 	}
 	// Earlier words must remain zero.
@@ -545,7 +551,8 @@ func TestJSONMarshalShape(t *testing.T) {
 		want string
 	}{
 		{NB{}, "[]"},
-		{FromBit(0, 4), "[17]"},
+		{FromBit(0, 4), "[0,4]"},
+		{FromBit(0, 4, 64), "[0,4,64]"},
 	}
 	for _, tc := range cases {
 		data, err := json.Marshal(tc.n)
@@ -570,16 +577,16 @@ func TestJSONUnmarshalNull(t *testing.T) {
 
 func TestJSONUnmarshalReplaces(t *testing.T) {
 	n := FromValue(0xFF)
-	if err := json.Unmarshal([]byte("[1]"), &n); err != nil {
+	if err := json.Unmarshal([]byte("[0]"), &n); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
-	if !n.Equal(FromValue(1)) {
+	if !n.Equal(FromBit(0)) {
 		t.Errorf("Unmarshal should replace prior content, got %s", n)
 	}
 }
 
 func TestJSONUnmarshalRejectsGarbage(t *testing.T) {
-	cases := []string{`"abc"`, `{}`, `["x"]`}
+	cases := []string{`"abc"`, `{}`, `["x"]`, `[-1]`}
 	for _, input := range cases {
 		var n NB
 		if err := json.Unmarshal([]byte(input), &n); err == nil {
